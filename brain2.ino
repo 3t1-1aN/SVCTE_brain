@@ -1,7 +1,7 @@
 #include <Adafruit_NeoPixel.h>
 
 #define LED_PIN 9
-#define NUMPIXELS 40       // increase to 200 when ready
+#define NUMPIXELS 196
 
 #define TRIG_PIN 10
 #define ECHO_PIN 11
@@ -12,47 +12,54 @@ const int NUM_RELAYS = 7;
 Adafruit_NeoPixel strip(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ---- LED state machine ----
-// IDLE -> GREEN -> RED -> YELLOW -> BLUE -> IDLE -> ...
-enum LedState { STATE_IDLE, STATE_GREEN, STATE_RED, STATE_YELLOW, STATE_BLUE };
+// IDLE -> RED -> BLUE -> YELLOW -> GREEN -> ORANGE -> BLUEYELLOW -> ALL -> IDLE -> ...
+enum LedState {
+  STATE_IDLE,       // neural spark animation
+  STATE_RED,        // pin 2
+  STATE_BLUE,       // pin 3
+  STATE_YELLOW,     // pin 4
+  STATE_GREEN,      // pin 5
+  STATE_ORANGE,     // pin 6
+  STATE_BLUEYELLOW, // pin 7 — alternates blue and yellow
+  STATE_ALL         // pin 8 — all previous colors in segments
+};
 LedState ledState = STATE_IDLE;
 
-// RGB values for each pulse state
-const uint8_t pulseColors[][3] = {
-  {0,   0,   0  },  // STATE_IDLE  (unused)
-  {0,   255, 0  },  // STATE_GREEN
+// RGB values for single-color pulse states (indexed by enum value, stored in flash)
+const uint8_t pulseColors[][3] PROGMEM = {
+  {0,   0,   0  },  // STATE_IDLE       (unused)
   {255, 0,   0  },  // STATE_RED
-  {255, 180, 0  },  // STATE_YELLOW
   {0,   80,  255},  // STATE_BLUE
+  {255, 180, 0  },  // STATE_YELLOW
+  {0,   255, 0  },  // STATE_GREEN
+  {255, 80,  0  },  // STATE_ORANGE
 };
 
 // ---- Neural spark animation ----
-#define MAX_SPARKS 10      // increase to ~25 for 200 pixels
-#define TRAIL_DECAY 0.85f
-#define SPAWN_CHANCE 20    // % chance per frame
+// trail stores brightness 0-255 (uint8_t saves 588 bytes vs float)
+#define MAX_SPARKS 8
+#define SPAWN_CHANCE 20  // % chance per frame
 
 struct Spark {
   float pos;
   float speed;
-  int   dir;
-  bool  active;
+  int8_t dir;
+  bool   active;
 };
 
-Spark sparks[MAX_SPARKS];
-float trail[NUMPIXELS];
+Spark  sparks[MAX_SPARKS];
+uint8_t trail[NUMPIXELS];
 
 // ---- Timing ----
-unsigned long lastPixelUpdate  = 0;
-const unsigned long pixelInterval   = 25;    // ~40 fps
+unsigned long lastPixelUpdate = 0;
+const unsigned long pixelInterval  = 25;
 
-unsigned long lastSensorRead   = 0;
-const unsigned long sensorInterval  = 100;   // read sensor every 100ms
+unsigned long lastSensorRead = 0;
+const unsigned long sensorInterval = 100;
 
-bool handWasPresent = false;  // track previous state for edge detection
-
-// ---- Relays ----
-int  currentRelay   = -1;
-bool relaysFinished = false;
-
+bool handWasPresent = false;
+unsigned long lastActivityTime = 0;
+const unsigned long idleTimeout = 30000;
 
 // ---- Ultrasonic ----
 long readDistanceCM()
@@ -70,7 +77,7 @@ long readDistanceCM()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("System starting...");
+  Serial.println(F("System starting..."));
 
   strip.begin();
   strip.setBrightness(80);
@@ -83,13 +90,11 @@ void setup()
   {
     pinMode(relays[i], OUTPUT);
     digitalWrite(relays[i], HIGH);
-    Serial.print("Relay initialized on pin ");
-    Serial.println(relays[i]);
   }
 
   memset(trail,  0, sizeof(trail));
   memset(sparks, 0, sizeof(sparks));
-  Serial.println("Setup complete.");
+  Serial.println(F("Setup complete."));
 }
 
 // ---- Neural animation ----
@@ -100,7 +105,7 @@ void trySpawnSpark()
     if (!sparks[i].active)
     {
       sparks[i].pos    = random(NUMPIXELS);
-      sparks[i].speed  = 0.8f + random(0, 120) / 100.0f;  // 0.8 - 2.0 px/frame
+      sparks[i].speed  = 0.8f + random(0, 120) / 100.0f;
       sparks[i].dir    = (random(2) == 0) ? 1 : -1;
       sparks[i].active = true;
       return;
@@ -110,16 +115,12 @@ void trySpawnSpark()
 
 void updateNeuralAnimation()
 {
-  // Decay trail
+  // Decay: multiply by ~0.85 using integer math (217/256 ≈ 0.848)
   for (int i = 0; i < NUMPIXELS; i++)
-  {
-    trail[i] *= TRAIL_DECAY;
-    if (trail[i] < 0.005f) trail[i] = 0;
-  }
+    trail[i] = (uint8_t)((uint16_t)trail[i] * 217 >> 8);
 
   if (random(100) < SPAWN_CHANCE) trySpawnSpark();
 
-  // Move sparks
   for (int i = 0; i < MAX_SPARKS; i++)
   {
     if (!sparks[i].active) continue;
@@ -134,45 +135,95 @@ void updateNeuralAnimation()
 
     int   p    = (int)sparks[i].pos;
     float frac = sparks[i].pos - p;
-    trail[p] = min(1.0f, trail[p] + (1.0f - frac));
+
+    // Deposit brightness (0-255 scale)
+    int add0 = (int)(255 * (1.0f - frac));
+    int add1 = (int)(255 * frac);
+    trail[p] = (uint8_t)min(255, trail[p] + add0);
     if (p + 1 < NUMPIXELS)
-      trail[p + 1] = min(1.0f, trail[p + 1] + frac);
+      trail[p + 1] = (uint8_t)min(255, trail[p + 1] + add1);
   }
 
-  // Render: deep blue trail, white-blue tip
+  // Render: deep blue trail, white-blue tip (quadratic color scaling)
   for (int i = 0; i < NUMPIXELS; i++)
   {
-    float b = trail[i];
-    if (b < 0.005f)
+    uint8_t b = trail[i];
+    if (b < 2)
     {
       strip.setPixelColor(i, 0);
     }
     else
     {
       strip.setPixelColor(i, strip.Color(
-        (uint8_t)(60  * b * b),
-        (uint8_t)(80  * b * b),
-        (uint8_t)(255 * b)
+        (uint8_t)((60UL  * b * b) / 65025),
+        (uint8_t)((80UL  * b * b) / 65025),
+        b
       ));
     }
   }
   strip.show();
 }
 
-// ---- Pulse animation ----
+// ---- Single-color pulse animation ----
 void updatePulseAnimation(uint8_t r, uint8_t g, uint8_t b)
 {
-  // Brightness oscillates between ~15% and 100% at ~0.8 Hz
   float t = millis() / 1000.0f;
   float brightness = 0.575f + 0.425f * sin(t * TWO_PI * 0.8f);
 
-  uint8_t pr = (uint8_t)(r * brightness);
-  uint8_t pg = (uint8_t)(g * brightness);
-  uint8_t pb = (uint8_t)(b * brightness);
+  for (int i = 0; i < NUMPIXELS; i++)
+    strip.setPixelColor(i, strip.Color(
+      (uint8_t)(r * brightness),
+      (uint8_t)(g * brightness),
+      (uint8_t)(b * brightness)
+    ));
+
+  strip.show();
+}
+
+// ---- Blue/yellow alternating animation (pin 7) ----
+void updateBlueYellowAnimation()
+{
+  float t     = millis() / 1000.0f;
+  float blend = 0.5f + 0.5f * sin(t * TWO_PI * 0.6f);  // 0=blue, 1=yellow
+
+  uint8_t r = (uint8_t)(255 * blend);
+  uint8_t g = (uint8_t)(80  * blend);
+  uint8_t bv = (uint8_t)(255 * (1.0f - blend));
 
   for (int i = 0; i < NUMPIXELS; i++)
-    strip.setPixelColor(i, strip.Color(pr, pg, pb));
+    strip.setPixelColor(i, strip.Color(r, g, bv));
 
+  strip.show();
+}
+
+// ---- All-colors animation (pin 8) ----
+// Strip split into 5 segments, one per previous color, all pulsing together.
+void updateAllColorsAnimation()
+{
+  const uint8_t colors[5][3] = {
+    {255, 0,   0  },  // red
+    {0,   80,  255},  // blue
+    {255, 180, 0  },  // yellow
+    {0,   255, 0  },  // green
+    {255, 80,  0  },  // orange
+  };
+
+  float t = millis() / 1000.0f;
+  float brightness = 0.575f + 0.425f * sin(t * TWO_PI * 0.8f);
+
+  int segmentSize = NUMPIXELS / 5;
+
+  for (int i = 0; i < NUMPIXELS; i++)
+  {
+    int seg = i / segmentSize;
+    if (seg >= 5) seg = 4;
+
+    strip.setPixelColor(i, strip.Color(
+      (uint8_t)(colors[seg][0] * brightness),
+      (uint8_t)(colors[seg][1] * brightness),
+      (uint8_t)(colors[seg][2] * brightness)
+    ));
+  }
   strip.show();
 }
 
@@ -181,40 +232,39 @@ void advanceLedState()
 {
   switch (ledState)
   {
-    case STATE_IDLE:   ledState = STATE_GREEN;  Serial.println("-> GREEN");  break;
-    case STATE_GREEN:  ledState = STATE_RED;    Serial.println("-> RED");    break;
-    case STATE_RED:    ledState = STATE_YELLOW; Serial.println("-> YELLOW"); break;
-    case STATE_YELLOW: ledState = STATE_BLUE;   Serial.println("-> BLUE");   break;
-    case STATE_BLUE:
+    case STATE_IDLE:       ledState = STATE_RED;        Serial.println(F("-> RED"));        break;
+    case STATE_RED:        ledState = STATE_BLUE;       Serial.println(F("-> BLUE"));       break;
+    case STATE_BLUE:       ledState = STATE_YELLOW;     Serial.println(F("-> YELLOW"));     break;
+    case STATE_YELLOW:     ledState = STATE_GREEN;      Serial.println(F("-> GREEN"));      break;
+    case STATE_GREEN:      ledState = STATE_ORANGE;     Serial.println(F("-> ORANGE"));     break;
+    case STATE_ORANGE:     ledState = STATE_BLUEYELLOW; Serial.println(F("-> BLUEYELLOW")); break;
+    case STATE_BLUEYELLOW: ledState = STATE_ALL;        Serial.println(F("-> ALL"));        break;
+    case STATE_ALL:
       ledState = STATE_IDLE;
-      Serial.println("-> IDLE (neural)");
-      // Clear trail so neural animation starts fresh
+      Serial.println(F("-> IDLE"));
       memset(trail,  0, sizeof(trail));
       memset(sparks, 0, sizeof(sparks));
       break;
   }
 }
 
-// ---- Relay sequencing (unchanged from original) ----
-void activateNextRelay()
+// ---- Relay control ----
+void updateRelayForState()
 {
-  currentRelay++;
-  Serial.print("Activating relay index: ");
-  Serial.println(currentRelay);
+  for (int i = 0; i < NUM_RELAYS; i++)
+    digitalWrite(relays[i], LOW);
 
-  if (currentRelay >= NUM_RELAYS)
+  switch (ledState)
   {
-    Serial.println("All relays activated. FINAL STATE.");
-    relaysFinished = true;
-    for (int i = 0; i < NUM_RELAYS; i++) digitalWrite(relays[i], LOW);
-    return;
+    case STATE_RED:        digitalWrite(relays[0], HIGH); break;  // pin 2
+    case STATE_BLUE:       digitalWrite(relays[1], HIGH); break;  // pin 3
+    case STATE_YELLOW:     digitalWrite(relays[2], HIGH); break;  // pin 4
+    case STATE_GREEN:      digitalWrite(relays[3], HIGH); break;  // pin 5
+    case STATE_ORANGE:     digitalWrite(relays[4], HIGH); break;  // pin 6
+    case STATE_BLUEYELLOW: digitalWrite(relays[5], HIGH); break;  // pin 7
+    case STATE_ALL:        digitalWrite(relays[6], HIGH); break;  // pin 8
+    default: break;
   }
-
-  for (int i = 0; i < NUM_RELAYS; i++) digitalWrite(relays[i], HIGH);
-  digitalWrite(relays[currentRelay], LOW);
-
-  Serial.print("Relay ON at pin ");
-  Serial.println(relays[currentRelay]);
 }
 
 // ---- Main loop ----
@@ -222,37 +272,54 @@ void loop()
 {
   unsigned long now = millis();
 
-  // Update LED animation on interval
   if (now - lastPixelUpdate >= pixelInterval)
   {
     lastPixelUpdate = now;
 
-    if (ledState == STATE_IDLE)
+    switch (ledState)
     {
-      updateNeuralAnimation();
-    }
-    else
-    {
-      const uint8_t* c = pulseColors[ledState];
-      updatePulseAnimation(c[0], c[1], c[2]);
+      case STATE_IDLE:
+        updateNeuralAnimation();
+        break;
+      case STATE_BLUEYELLOW:
+        updateBlueYellowAnimation();
+        break;
+      case STATE_ALL:
+        updateAllColorsAnimation();
+        break;
+      default:
+      {
+        uint8_t r = pgm_read_byte(&pulseColors[ledState][0]);
+        uint8_t g = pgm_read_byte(&pulseColors[ledState][1]);
+        uint8_t b = pgm_read_byte(&pulseColors[ledState][2]);
+        updatePulseAnimation(r, g, b);
+        break;
+      }
     }
   }
 
-  // Check sensor every 100ms
   if (now - lastSensorRead >= sensorInterval)
   {
     lastSensorRead = now;
     long distance  = readDistanceCM();
 
-    // Hand is present if something is within 30cm
     bool handPresent = (distance > 0 && distance < 30);
 
-    // Only trigger on the moment the hand ENTERS the zone
     if (handPresent && !handWasPresent)
     {
-      Serial.println("HAND DETECTED");
+      Serial.println(F("HAND DETECTED"));
+      lastActivityTime = now;
       advanceLedState();
-      if (!relaysFinished) activateNextRelay();
+      updateRelayForState();
+    }
+
+    if (ledState != STATE_IDLE && (now - lastActivityTime >= idleTimeout))
+    {
+      Serial.println(F("Timeout - returning to idle"));
+      ledState = STATE_IDLE;
+      updateRelayForState();
+      memset(trail,  0, sizeof(trail));
+      memset(sparks, 0, sizeof(sparks));
     }
 
     handWasPresent = handPresent;
