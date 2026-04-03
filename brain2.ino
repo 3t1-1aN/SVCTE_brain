@@ -59,7 +59,7 @@ const unsigned long sensorInterval = 100;
 
 bool handWasPresent = false;
 unsigned long lastActivityTime = 0;
-const unsigned long idleTimeout = 30000;
+const unsigned long idleTimeout = 60000;
 
 // ---- Ultrasonic ----
 long readDistanceCM()
@@ -181,14 +181,28 @@ void updatePulseAnimation(uint8_t r, uint8_t g, uint8_t b)
 }
 
 // ---- Blue/yellow alternating animation (pin 7) ----
+// Pulses yellow, briefly goes dark, pulses blue, briefly goes dark, repeat.
 void updateBlueYellowAnimation()
 {
-  float t     = millis() / 1000.0f;
-  float blend = 0.5f + 0.5f * sin(t * TWO_PI * 0.6f);  // 0=blue, 1=yellow
+  float t    = millis() / 1000.0f;
+  float wave = sin(t * TWO_PI * 0.4f);  // ~0.4 Hz — full cycle ~2.5s
+  float brightness = fabs(wave);         // 0-1, creates fade in/out for each color
 
-  uint8_t r = (uint8_t)(255 * blend);
-  uint8_t g = (uint8_t)(80  * blend);
-  uint8_t bv = (uint8_t)(255 * (1.0f - blend));
+  uint8_t r, g, bv;
+  if (wave >= 0)
+  {
+    // Yellow phase
+    r  = (uint8_t)(255 * brightness);
+    g  = (uint8_t)(180 * brightness);
+    bv = 0;
+  }
+  else
+  {
+    // Blue phase
+    r  = 0;
+    g  = 0;
+    bv = (uint8_t)(255 * brightness);
+  }
 
   for (int i = 0; i < NUMPIXELS; i++)
     strip.setPixelColor(i, strip.Color(r, g, bv));
@@ -263,6 +277,9 @@ void updateRelayForState()
     case STATE_ORANGE:     digitalWrite(relays[4], HIGH); break;  // pin 6
     case STATE_BLUEYELLOW: digitalWrite(relays[5], HIGH); break;  // pin 7
     case STATE_ALL:        digitalWrite(relays[6], HIGH); break;  // pin 8
+    case STATE_IDLE:
+      for (int i = 0; i < NUM_RELAYS; i++) digitalWrite(relays[i], HIGH);
+      break;
     default: break;
   }
 }
